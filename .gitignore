@@ -1,0 +1,4 @@
+venv/
+.streamlit/
+campaign_finance.db
+__pycache__/
