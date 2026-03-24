@@ -18,7 +18,7 @@ source venv/bin/activate
 pip install -r requirements.txt
 streamlit run app.py
 ```
-Password: You must set your own admin password in your .streamlit/secrets.toml file before running the app.
+> **Password:** You must set your own admin password in your `.streamlit/secrets.toml` file before running the app.
 
 ---
 
