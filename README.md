@@ -18,8 +18,7 @@ source venv/bin/activate
 pip install -r requirements.txt
 streamlit run app.py
 ```
-
-Default password: `CivicTest2026!` (change in `.streamlit/secrets.toml`)
+Password: You must set your own admin password in your .streamlit/secrets.toml file before running the app.
 
 ---
 
