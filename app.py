@@ -5,13 +5,41 @@ Politician profile system with searchable directory, per-profile financial
 records, community reviews, shadow voting, and AI anomaly detection.
 
 Run:  streamlit run app.py
+
+PATCH NOTES (all 12 audit bugs fixed):
+  CRITICAL
+    [1] Upload gate enforced — TRUST_UPLOAD_GATE checked in render_upload_section
+    [2] Correction form routes through safe_insert_expense (rate limit, quarantine, bounds)
+    [3] Unregistered users (submitted_by=None) default trust=-1 → always quarantined
+    [4] XSS fixed — html.escape() applied before every unsafe_allow_html injection
+  HIGH
+    [5] get_politician uses row_factory — single query, no double-SELECT
+    [6] approve_quarantine is fully atomic (BEGIN EXCLUSIVE … COMMIT)
+    [7] Force-submit duplicate checkbox now actually rendered in the UI
+  MEDIUM
+    [8] Database indexes added in init_db for slug, record_id, status, window
+    [9] IsolationForest contamination replaced with score_samples + 2σ threshold
+   [10] Session trust_score re-read from DB on every rerun (stale-state fix)
+  LOW
+   [11] Per-review vote deduplication via session_state set + review_votes DB table
+   [12] Hardcoded fallback password removed — app hard-stops if secret not configured
 """
 
-import streamlit as st
-import pandas as pd
+import html as html_mod
+import io
+import csv
+import json
+import math
+import re
+import sqlite3
+import time
+import uuid
+
 import numpy as np
+import pandas as pd
+import requests
+import streamlit as st
 from sklearn.ensemble import IsolationForest
-import math, sqlite3, requests, uuid, time, io, csv, json, re
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 0.  PAGE CONFIG
@@ -26,15 +54,17 @@ st.set_page_config(
 # ─────────────────────────────────────────────────────────────────────────────
 # 1.  SECRETS / OPEN-CORE CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
-def _s(key, default):
+def _s(key, default=None):
     try:    return st.secrets[key]
     except: return default
 
-def _ss(section, key, default):
+def _ss(section, key, default=None):
     try:    return st.secrets[section][key]
     except: return default
 
-TEAM_PASSWORD      = _s("team_password", "CivicTest2026!")
+# FIX [12]: No hardcoded fallback — None forces hard-stop below
+TEAM_PASSWORD      = _s("team_password")
+
 MIN_REVIEW_LEN     = int(_ss("security", "min_review_length",    80))
 TRUST_VOTE_GATE    = int(_ss("security", "trust_vote_gate",       5))
 TRUST_UPLOAD_GATE  = int(_ss("security", "trust_upload_gate",    15))
@@ -46,11 +76,10 @@ NLP_RED_FLAGS      = _ss("security", "nlp_red_flags", [
 ])
 DB_PATH = "campaign_finance.db"
 
-# Fraud-prevention thresholds (hidden in secrets)
-MAX_SUBMISSIONS_PER_HOUR = int(_ss("security","max_submissions_per_hour", 50))
-MAX_AMOUNT_KES           = float(_ss("security","max_single_amount_kes",  500_000_000))
-MIN_AMOUNT_KES           = float(_ss("security","min_single_amount_kes",  1.0))
-QUARANTINE_TRUST_GATE    = int(_ss("security","quarantine_trust_gate",    3))
+MAX_SUBMISSIONS_PER_HOUR = int(_ss("security", "max_submissions_per_hour", 50))
+MAX_AMOUNT_KES           = float(_ss("security", "max_single_amount_kes",  500_000_000))
+MIN_AMOUNT_KES           = float(_ss("security", "min_single_amount_kes",  1.0))
+QUARANTINE_TRUST_GATE    = int(_ss("security", "quarantine_trust_gate",    3))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2.  PASSWORD BOUNCER
@@ -58,6 +87,16 @@ QUARANTINE_TRUST_GATE    = int(_ss("security","quarantine_trust_gate",    3))
 def check_password():
     if st.session_state.get("authenticated"):
         return
+
+    # FIX [12]: Hard-stop if no secret is configured — no fallback password
+    if TEAM_PASSWORD is None:
+        st.error(
+            "⚠️ No `team_password` configured in `st.secrets`. "
+            "Add it to `.streamlit/secrets.toml` before deploying.\n\n"
+            "```toml\nteam_password = \"your-strong-password-here\"\n```"
+        )
+        st.stop()
+
     st.markdown("## 🔒 CivicTech – Restricted Access")
     st.caption("This testing environment is restricted to authorised team members.")
     pwd = st.text_input("Team password", type="password", key="pwd_in")
@@ -78,7 +117,6 @@ def init_db():
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
 
-        # ── Politician profiles ───────────────────────────────────────────────
         c.execute("""
             CREATE TABLE IF NOT EXISTS politicians (
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -94,7 +132,6 @@ def init_db():
                 created_at    DATETIME DEFAULT CURRENT_TIMESTAMP
             )""")
 
-        # ── Append-only expense ledger (linked to politician slug) ────────────
         c.execute("""
             CREATE TABLE IF NOT EXISTS expenses (
                 id               INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -109,7 +146,6 @@ def init_db():
                 timestamp        DATETIME DEFAULT CURRENT_TIMESTAMP
             )""")
 
-        # ── Reviews (linked to politician slug OR specific record_id) ─────────
         c.execute("""
             CREATE TABLE IF NOT EXISTS reviews (
                 id               INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -122,7 +158,14 @@ def init_db():
                 timestamp        DATETIME DEFAULT CURRENT_TIMESTAMP
             )""")
 
-        # ── Anonymous citizen trust scores ────────────────────────────────────
+        # FIX [11]: Deduplicate votes at DB level
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS review_votes (
+                anon_id    TEXT NOT NULL,
+                review_id  INTEGER NOT NULL,
+                PRIMARY KEY (anon_id, review_id)
+            )""")
+
         c.execute("""
             CREATE TABLE IF NOT EXISTS citizens (
                 anon_id     TEXT    PRIMARY KEY,
@@ -130,7 +173,6 @@ def init_db():
                 created_at  DATETIME DEFAULT CURRENT_TIMESTAMP
             )""")
 
-        # ── Immutable audit log ───────────────────────────────────────────────
         c.execute("""
             CREATE TABLE IF NOT EXISTS audit_log (
                 id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -140,7 +182,6 @@ def init_db():
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
             )""")
 
-        # ── Quarantine — holds unverified submissions for moderator review ────
         c.execute("""
             CREATE TABLE IF NOT EXISTS quarantine (
                 id               INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -155,14 +196,27 @@ def init_db():
                 timestamp        DATETIME DEFAULT CURRENT_TIMESTAMP
             )""")
 
-        # ── Submission rate tracking (per anon_id, rolling 1-hour window) ────
         c.execute("""
             CREATE TABLE IF NOT EXISTS submission_counts (
-                anon_id    TEXT    NOT NULL,
+                anon_id      TEXT    NOT NULL,
                 window_start DATETIME NOT NULL,
-                count      INTEGER NOT NULL DEFAULT 0,
+                count        INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (anon_id, window_start)
             )""")
+
+        # FIX [8]: Add indexes for every high-frequency lookup
+        c.executescript("""
+            CREATE INDEX IF NOT EXISTS idx_expenses_slug
+                ON expenses(politician_slug, is_active);
+            CREATE INDEX IF NOT EXISTS idx_expenses_record
+                ON expenses(record_id);
+            CREATE INDEX IF NOT EXISTS idx_reviews_slug
+                ON reviews(politician_slug);
+            CREATE INDEX IF NOT EXISTS idx_quarantine_status
+                ON quarantine(politician_slug, status);
+            CREATE INDEX IF NOT EXISTS idx_submissions_window
+                ON submission_counts(anon_id, window_start);
+        """)
 
         conn.commit()
 
@@ -179,14 +233,9 @@ def log(action, actor=None, detail=None):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _name_tokens(name: str) -> set:
-    """Lower-case word tokens from a name, ignoring short words."""
     return {w for w in re.split(r"[\s\-]+", name.lower()) if len(w) > 2}
 
 def name_similarity(a: str, b: str) -> float:
-    """
-    Simple token-overlap similarity 0.0–1.0.
-    1.0 = identical tokens, 0.0 = no shared tokens.
-    """
     ta, tb = _name_tokens(a), _name_tokens(b)
     if not ta or not tb:
         return 0.0
@@ -195,43 +244,25 @@ def name_similarity(a: str, b: str) -> float:
 def detect_wrong_politician(file_df: pd.DataFrame,
                              target_slug: str,
                              target_name: str) -> list[dict]:
-    """
-    Scans every row of an uploaded file.
-    If a row contains a 'Politician' column whose value does NOT match the
-    target profile, flag it as a potential cross-contamination attempt.
-
-    Returns list of {row_index, found_name, similarity, risk_level}.
-    """
     warnings = []
     if "Politician" not in file_df.columns:
         return warnings
-
     for i, row in file_df.iterrows():
-        found = str(row.get("Politician","")).strip()
+        found = str(row.get("Politician", "")).strip()
         if not found or found == "—":
             continue
         sim = name_similarity(found, target_name)
-        # If the name in the file is clearly someone else (sim < 0.3)
-        # and it is not blank/generic
         if sim < 0.3 and len(found) > 3:
             risk = "HIGH" if sim < 0.1 else "MEDIUM"
             warnings.append({
-                "row":       i + 2,          # +2 for 1-index + header row
-                "found":     found,
+                "row":        i + 2,
+                "found":      found,
                 "similarity": round(sim, 2),
-                "risk":      risk,
+                "risk":       risk,
             })
     return warnings
 
-def check_duplicate_expense(politician_slug: str,
-                             amount: float,
-                             description: str,
-                             currency: str) -> dict | None:
-    """
-    Checks if an identical (amount + description + currency) record already
-    exists for this politician in the last 30 days.
-    Returns the duplicate row as a dict, or None if clean.
-    """
+def check_duplicate_expense(politician_slug, amount, description, currency) -> dict | None:
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute("""
             SELECT record_id, timestamp FROM expenses
@@ -243,15 +274,9 @@ def check_duplicate_expense(politician_slug: str,
               AND timestamp >= datetime('now', '-30 days')
             LIMIT 1""",
             (politician_slug, amount, description, currency)).fetchone()
-    if row:
-        return {"record_id": row[0], "timestamp": row[1]}
-    return None
+    return {"record_id": row[0], "timestamp": row[1]} if row else None
 
 def check_rate_limit(anon_id: str) -> tuple[bool, int]:
-    """
-    Sliding 1-hour window rate limiter per anon_id.
-    Returns (allowed: bool, current_count: int).
-    """
     if anon_id is None:
         return True, 0
     now_hour = time.strftime("%Y-%m-%d %H:00:00", time.gmtime())
@@ -276,16 +301,17 @@ def check_rate_limit(anon_id: str) -> tuple[bool, int]:
     return allowed, current
 
 def validate_amount(amount_kes: float) -> tuple[bool, str]:
-    """Hard bounds on KES amount — catches accidental or malicious nonsense."""
     if amount_kes < MIN_AMOUNT_KES:
-        return False, f"Amount KES {amount_kes:,.2f} is below the minimum allowed (KES {MIN_AMOUNT_KES:,.0f})."
+        return False, f"Amount KES {amount_kes:,.2f} is below the minimum (KES {MIN_AMOUNT_KES:,.0f})."
     if amount_kes > MAX_AMOUNT_KES:
-        return False, f"Amount KES {amount_kes:,.0f} exceeds the maximum single-transaction limit (KES {MAX_AMOUNT_KES:,.0f}). Split into separate records if legitimate."
+        return False, (
+            f"Amount KES {amount_kes:,.0f} exceeds the maximum single-transaction limit "
+            f"(KES {MAX_AMOUNT_KES:,.0f}). Split into separate records if legitimate."
+        )
     return True, ""
 
 def quarantine_expense(politician_slug, amount, currency,
                        description, submitted_by, reason):
-    """Send a suspicious record to the quarantine queue instead of the live ledger."""
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("""
             INSERT INTO quarantine
@@ -301,26 +327,35 @@ def get_quarantine() -> pd.DataFrame:
         return pd.read_sql_query(
             "SELECT * FROM quarantine ORDER BY timestamp DESC", conn)
 
-def approve_quarantine(q_id: int, moderator_id: str):
-    """Pull a quarantined item into the live ledger."""
+# FIX [6]: approve_quarantine is now fully atomic — single BEGIN EXCLUSIVE transaction
+def approve_quarantine(q_id: int, moderator_id: str) -> bool:
     with sqlite3.connect(DB_PATH) as conn:
-        row = conn.execute(
-            "SELECT * FROM quarantine WHERE id=?", (q_id,)).fetchone()
-        if not row:
-            return False
-        cols = [d[0] for d in conn.execute(
-            "SELECT * FROM quarantine WHERE id=?", (q_id,)).description]
-        rec = dict(zip(cols, row))
-    insert_expense(
-        rec["politician_slug"], rec["original_amount"],
-        rec["currency"], rec["description"],
-        submitted_by=rec["submitted_by"],
-    )
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            "UPDATE quarantine SET status='approved', reviewed_by=? WHERE id=?",
-            (moderator_id, q_id))
-        conn.commit()
+        conn.isolation_level = None          # manual transaction control
+        conn.execute("BEGIN EXCLUSIVE")
+        try:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT * FROM quarantine WHERE id=? AND status='pending'",
+                (q_id,)).fetchone()
+            if not row:
+                conn.execute("ROLLBACK")
+                return False
+            rec = dict(row)
+            rid = str(uuid.uuid4())
+            conn.execute("""
+                INSERT INTO expenses
+                  (record_id, politician_slug, original_amount, currency,
+                   description, version, is_active, submitted_by)
+                VALUES (?,?,?,?,?,1,1,?)""",
+                (rid, rec["politician_slug"], rec["original_amount"],
+                 rec["currency"], rec["description"], rec["submitted_by"]))
+            conn.execute(
+                "UPDATE quarantine SET status='approved', reviewed_by=? WHERE id=?",
+                (moderator_id, q_id))
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
     log("QUARANTINE_APPROVE", moderator_id, f"q_id={q_id}")
     return True
 
@@ -337,12 +372,10 @@ def safe_insert_expense(politician_slug, target_name, amount_kes,
                         submitted_by, force=False) -> dict:
     """
     Single entry-point for ALL expense insertions.
-    Runs every fraud check before touching the ledger.
-
     Returns:
-      {"status": "ok"}                    → inserted cleanly
-      {"status": "quarantined", "reason"} → held for moderator review
-      {"status": "rejected",    "reason"} → hard-blocked, not saved at all
+      {"status": "ok"}
+      {"status": "quarantined", "reason"}
+      {"status": "rejected",    "reason"}
       {"status": "duplicate",   "existing_record_id", "timestamp"}
     """
     # 1. Rate limit
@@ -361,39 +394,52 @@ def safe_insert_expense(politician_slug, target_name, amount_kes,
         return {"status": "rejected", "reason": err}
 
     # 3. Duplicate check
-    dup = check_duplicate_expense(politician_slug, original_amount,
-                                  description, currency)
+    dup = check_duplicate_expense(politician_slug, original_amount, description, currency)
     if dup and not force:
         return {"status": "duplicate",
                 "existing_record_id": dup["record_id"],
-                "timestamp": dup["timestamp"]}
+                "timestamp":          dup["timestamp"]}
 
-    # 4. Low-trust users → quarantine instead of live ledger
-    trust = login_citizen(submitted_by) if submitted_by else None
-    if trust is not None and trust < QUARANTINE_TRUST_GATE and not force:
+    # 4. Trust gate — FIX [3]: unregistered users default to trust=-1, always quarantined
+    trust = login_citizen(submitted_by) if submitted_by else -1
+    if trust < QUARANTINE_TRUST_GATE and not force:
         quarantine_expense(politician_slug, original_amount, currency,
                            description, submitted_by,
-                           "Low trust score — pending moderator review")
+                           f"Trust score ({trust}) below threshold "
+                           f"({QUARANTINE_TRUST_GATE}) — pending moderator review")
         return {"status": "quarantined",
                 "reason": f"Your Trust Score ({trust}) is below the threshold "
                            f"({QUARANTINE_TRUST_GATE}) for direct submission. "
                            "Your record has been queued for moderator review."}
 
-    # 5. All checks passed → insert
+    # 5. All checks passed
     insert_expense(politician_slug, original_amount, currency,
                    description, submitted_by=submitted_by)
     return {"status": "ok"}
 
+# ─────────────────────────────────────────────────────────────────────────────
+# XSS HELPER — FIX [4]
+# ─────────────────────────────────────────────────────────────────────────────
+def safe_avatar(initials: str, size: int = 48, font: int = 18,
+                margin_bottom: int = 8) -> str:
+    """Return an HTML avatar circle with HTML-escaped initials."""
+    safe = html_mod.escape(initials)
+    return (
+        f"<div style='width:{size}px;height:{size}px;border-radius:50%;"
+        f"background:#1f4e79;color:white;display:flex;"
+        f"align-items:center;justify-content:center;"
+        f"font-size:{font}px;font-weight:600;margin-bottom:{margin_bottom}px'>"
+        f"{safe}</div>"
+    )
+
 # ── Politician helpers ────────────────────────────────────────────────────────
 def make_slug(name: str) -> str:
-    """Convert 'John Kamau Njoroge' → 'john-kamau-njoroge'"""
     return re.sub(r"[^a-z0-9]+", "-", name.lower().strip()).strip("-")
 
 def create_politician(full_name, role="", party="", county="",
                       constituency="", photo_url="", bio="", created_by=None):
     slug = make_slug(full_name)
     base_slug = slug
-    # Guarantee uniqueness
     with sqlite3.connect(DB_PATH) as conn:
         i = 1
         while conn.execute("SELECT 1 FROM politicians WHERE slug=?", (slug,)).fetchone():
@@ -414,8 +460,8 @@ def update_politician(slug, **kwargs):
     if not fields:
         return
     with sqlite3.connect(DB_PATH) as conn:
-        sets  = ", ".join(f"{k}=?" for k in fields)
-        vals  = list(fields.values()) + [slug]
+        sets = ", ".join(f"{k}=?" for k in fields)
+        vals = list(fields.values()) + [slug]
         conn.execute(f"UPDATE politicians SET {sets} WHERE slug=?", vals)
         conn.commit()
 
@@ -424,28 +470,26 @@ def get_all_politicians() -> pd.DataFrame:
         return pd.read_sql_query(
             "SELECT * FROM politicians ORDER BY full_name ASC", conn)
 
+# FIX [5]: Single query using row_factory — no double-SELECT
 def get_politician(slug: str) -> dict | None:
     with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
         row = conn.execute(
             "SELECT * FROM politicians WHERE slug=?", (slug,)).fetchone()
-        if not row:
-            return None
-        cols = [d[0] for d in conn.execute(
-            "SELECT * FROM politicians WHERE slug=?", (slug,)).description]
-    return dict(zip(cols, row))
+    return dict(row) if row else None
 
 def search_politicians(query: str) -> pd.DataFrame:
     q = f"%{query.lower()}%"
     with sqlite3.connect(DB_PATH) as conn:
         return pd.read_sql_query("""
             SELECT * FROM politicians
-            WHERE lower(full_name) LIKE ?
-               OR lower(role)      LIKE ?
-               OR lower(party)     LIKE ?
-               OR lower(county)    LIKE ?
-               OR lower(constituency) LIKE ?
+            WHERE lower(full_name)       LIKE ?
+               OR lower(role)            LIKE ?
+               OR lower(party)           LIKE ?
+               OR lower(county)          LIKE ?
+               OR lower(constituency)    LIKE ?
             ORDER BY full_name ASC""",
-            conn, params=(q,q,q,q,q))
+            conn, params=(q, q, q, q, q))
 
 # ── Expense helpers ───────────────────────────────────────────────────────────
 def insert_expense(politician_slug, amount, currency, description,
@@ -505,12 +549,32 @@ def get_reviews(politician_slug=None) -> pd.DataFrame:
         return pd.read_sql_query(
             "SELECT * FROM reviews ORDER BY upvotes DESC, timestamp DESC", conn)
 
-def cast_vote(review_id, vote_power):
+# FIX [11]: cast_vote now records the vote in review_votes to prevent repeat voting
+def cast_vote(review_id: int, anon_id: str, vote_power: int) -> bool:
+    """
+    Returns True if the vote was recorded, False if the user already voted.
+    vote_power=0 for shadow votes (low-trust users) — logged but not counted.
+    """
     with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            "UPDATE reviews SET upvotes=upvotes+? WHERE id=?",
-            (vote_power, review_id))
-        conn.commit()
+        try:
+            conn.execute(
+                "INSERT INTO review_votes (anon_id, review_id) VALUES (?,?)",
+                (anon_id, review_id))
+            conn.execute(
+                "UPDATE reviews SET upvotes=upvotes+? WHERE id=?",
+                (vote_power, review_id))
+            conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            # PRIMARY KEY violation → already voted
+            return False
+
+def has_voted(review_id: int, anon_id: str) -> bool:
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT 1 FROM review_votes WHERE anon_id=? AND review_id=?",
+            (anon_id, review_id)).fetchone()
+    return row is not None
 
 # ── Citizen helpers ───────────────────────────────────────────────────────────
 def register_citizen(anon_id):
@@ -520,7 +584,7 @@ def register_citizen(anon_id):
             (anon_id,))
         conn.commit()
 
-def login_citizen(anon_id):
+def login_citizen(anon_id) -> int | None:
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute(
             "SELECT trust_score FROM citizens WHERE anon_id=?",
@@ -562,12 +626,12 @@ def benfords_score(amounts):
         return None
     digits = []
     for a in s:
-        x = str(abs(float(a))).replace(".","").lstrip("0")
+        x = str(abs(float(a))).replace(".", "").lstrip("0")
         if x: digits.append(int(x[0]))
     obs = (pd.Series(digits).value_counts(normalize=True)
-           .reindex(range(1,10), fill_value=0).values)
-    exp = np.array([math.log10(1+1/d) for d in range(1,10)])
-    return round(min(float(np.mean(np.abs(obs-exp)))*500, 100), 1), obs, exp
+           .reindex(range(1, 10), fill_value=0).values)
+    exp = np.array([math.log10(1 + 1/d) for d in range(1, 10)])
+    return round(min(float(np.mean(np.abs(obs - exp))) * 500, 100), 1), obs, exp
 
 def run_pipeline(df, rates):
     if df.empty:
@@ -575,12 +639,17 @@ def run_pipeline(df, rates):
     df = df.copy()
     df["amount_kes"] = df.apply(
         lambda r: to_kes(r["original_amount"], r["currency"], rates), axis=1)
-    df["flag_text"]   = df["description"].apply(
+    df["flag_text"] = df["description"].apply(
         lambda x: any(kw in str(x).lower() for kw in NLP_RED_FLAGS))
+
+    # FIX [9]: Replace contamination=0.1 (always flags 10%) with score_samples + 2σ threshold
     df["flag_amount"] = False
     if len(df) >= 6:
-        model = IsolationForest(contamination=0.1, random_state=42)
-        df["flag_amount"] = model.fit_predict(df[["amount_kes"]]) == -1
+        model  = IsolationForest(contamination="auto", random_state=42)
+        scores = model.fit(df[["amount_kes"]]).score_samples(df[["amount_kes"]])
+        threshold = scores.mean() - 2 * scores.std()
+        df["flag_amount"] = scores < threshold
+
     df["is_flagged"] = df["flag_text"] | df["flag_amount"]
     return df
 
@@ -654,7 +723,7 @@ def normalise_cols(df):
     still = [c for c in COLUMN_ALIASES if c not in df.columns]
     if still:
         fz = fuzzy_match(df, still)
-        if fz: df = df.rename(columns={v:k for k,v in fz.items()})
+        if fz: df = df.rename(columns={v: k for k, v in fz.items()})
     return df, [c for c in COLUMN_ALIASES if c not in df.columns]
 
 def sniff_delim(raw):
@@ -669,22 +738,21 @@ def parse_file(uploaded):
     name = uploaded.name.lower()
     raw  = uploaded.read(); uploaded.seek(0)
     try:
-        if name.endswith((".xlsx",".xls")):
+        if name.endswith((".xlsx", ".xls")):
             return pd.read_excel(io.BytesIO(raw)), ""
         if name.endswith(".ods"):
             return pd.read_excel(io.BytesIO(raw), engine="odf"), ""
-        if name.endswith((".json",".jsonl")):
+        if name.endswith((".json", ".jsonl")):
             txt = raw.decode("utf-8", errors="ignore")
             try:
                 d = json.loads(txt)
-                return pd.DataFrame(d if isinstance(d,list) else [d]), ""
+                return pd.DataFrame(d if isinstance(d, list) else [d]), ""
             except json.JSONDecodeError:
                 lines = [l.strip() for l in txt.splitlines() if l.strip()]
                 return pd.DataFrame([json.loads(l) for l in lines]), ""
         if name.endswith(".tsv"):
             return pd.read_csv(io.BytesIO(raw), sep="\t",
                                encoding="utf-8", on_bad_lines="skip"), ""
-        # CSV / TXT / anything else
         delim = sniff_delim(raw)
         return pd.read_csv(io.BytesIO(raw), sep=delim,
                            encoding="utf-8", on_bad_lines="skip",
@@ -696,13 +764,20 @@ def parse_file(uploaded):
 # 7.  SESSION STATE
 # ─────────────────────────────────────────────────────────────────────────────
 init_db()
-for k,v in {"anon_id":None,"trust_score":0,
-            "last_action_time":0.0,"view":"directory",
-            "active_slug":None}.items():
+
+for k, v in {"anon_id": None, "trust_score": 0,
+             "last_action_time": 0.0, "view": "directory",
+             "active_slug": None, "voted_reviews": set()}.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
 rates = get_rates()
+
+# FIX [10]: Re-sync trust_score from DB on every rerun — prevents stale session state
+if st.session_state.get("anon_id"):
+    live_score = login_citizen(st.session_state["anon_id"])
+    if live_score is not None:
+        st.session_state["trust_score"] = live_score
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 8.  SIDEBAR — Identity + navigation
@@ -712,7 +787,6 @@ with st.sidebar:
     st.caption("Kenya Campaign Finance Watchdog")
     st.divider()
 
-    # Identity
     st.markdown("### 🕵️ Citizen Identity")
     st.caption("No email required. Save your ID to keep your Trust Score.")
 
@@ -741,27 +815,27 @@ with st.sidebar:
         st.metric("🏆 Trust Score", st.session_state["trust_score"])
         st.caption("Score ≥ 5 → votes count  |  ≥ 15 → file uploads unlocked")
         if st.button("Log out", use_container_width=True):
-            st.session_state.update({"anon_id":None,"trust_score":0})
+            st.session_state.update({"anon_id": None, "trust_score": 0,
+                                     "voted_reviews": set()})
             st.rerun()
 
     st.divider()
 
-    # Navigation
     st.markdown("### 🗺️ Navigation")
     if st.button("🏠 Politician Directory",   use_container_width=True):
-        st.session_state.update({"view":"directory","active_slug":None})
+        st.session_state.update({"view": "directory", "active_slug": None})
         st.rerun()
     if st.button("➕ Add New Politician",      use_container_width=True):
-        st.session_state.update({"view":"create","active_slug":None})
+        st.session_state.update({"view": "create", "active_slug": None})
         st.rerun()
     if st.button("📊 National Overview",       use_container_width=True):
-        st.session_state.update({"view":"overview","active_slug":None})
+        st.session_state.update({"view": "overview", "active_slug": None})
         st.rerun()
     if st.button("🔶 Moderator Queue",         use_container_width=True):
-        st.session_state.update({"view":"modqueue","active_slug":None})
+        st.session_state.update({"view": "modqueue", "active_slug": None})
         st.rerun()
     if st.button("🔍 Audit Trail",             use_container_width=True):
-        st.session_state.update({"view":"audit","active_slug":None})
+        st.session_state.update({"view": "audit", "active_slug": None})
         st.rerun()
 
     st.divider()
@@ -790,7 +864,6 @@ COUNTIES = [
 ]
 
 def render_benford_section(df_expenses):
-    """Render Benford's Law analysis for a given expenses dataframe."""
     res = benfords_score(df_expenses["amount_kes"])
     if res is None:
         st.info("Need ≥ 10 expense records for Benford's Law analysis.")
@@ -804,18 +877,24 @@ def render_benford_section(df_expenses):
         st.success(f"🟢 Benford Suspicion Score: **{score}/100** — Looks natural.")
 
     chart_df = pd.DataFrame({
-        "Expected (Benford %)": np.round(exp*100, 1),
-        "Observed (%)":         np.round(obs*100, 1),
-    }, index=range(1,10))
+        "Expected (Benford %)": np.round(exp * 100, 1),
+        "Observed (%)":         np.round(obs * 100, 1),
+    }, index=range(1, 10))
     chart_df.index.name = "Leading Digit"
     st.bar_chart(chart_df)
 
 def render_upload_section(politician_slug, target_name=""):
-    """
-    Universal file uploader scoped to a specific politician.
-    Includes cross-contamination detection, duplicate checking,
-    rate limiting, amount bounds validation, and quarantine routing.
-    """
+    # FIX [1]: Enforce TRUST_UPLOAD_GATE before showing uploader
+    if (st.session_state["anon_id"] is None or
+            st.session_state["trust_score"] < TRUST_UPLOAD_GATE):
+        st.warning(
+            f"🔒 **File uploads require a Trust Score of {TRUST_UPLOAD_GATE}.**\n\n"
+            f"Your current score: **{st.session_state.get('trust_score', 0)}**.\n\n"
+            "Earn Trust Points by publishing community findings (1 point each). "
+            f"You need {TRUST_UPLOAD_GATE - st.session_state.get('trust_score', 0)} more point(s)."
+        )
+        return
+
     st.markdown(
         "Accepts: **Excel** (.xlsx .xls), **CSV**, **TSV**, **TXT**, "
         "**JSON** (.json .jsonl), **ODS**\n\n"
@@ -823,8 +902,6 @@ def render_upload_section(politician_slug, target_name=""):
         "The Politician column is **ignored** — all records are automatically "
         "locked to **this profile only**."
     )
-
-    # Warn clearly that the Politician column is ignored
     st.info(
         f"🔒 **All records in this file will be attributed to: {target_name}**\n\n"
         "If your file contains records for multiple politicians, upload each "
@@ -861,10 +938,9 @@ def render_upload_section(politician_slug, target_name=""):
     if matched:
         st.success(f"✅ Auto-matched: {', '.join(matched)}")
 
-    # ── Cross-contamination scan ──────────────────────────────────────────────
-    # Check if the file contains names belonging to OTHER politicians
-    cross_warnings = detect_wrong_politician(df_norm if "Politician" in df_norm.columns
-                                             else df_raw, politician_slug, target_name)
+    cross_warnings = detect_wrong_politician(
+        df_norm if "Politician" in df_norm.columns else df_raw,
+        politician_slug, target_name)
     if cross_warnings:
         st.warning(
             f"⚠️ **Cross-contamination detected in {len(cross_warnings)} row(s)**\n\n"
@@ -880,11 +956,9 @@ def render_upload_section(politician_slug, target_name=""):
                     f"— Risk: **{w['risk']}**"
                 )
 
-    # Drop the Politician column entirely — we use politician_slug instead
     if "Politician" in df_norm.columns:
         df_norm = df_norm.drop(columns=["Politician"])
 
-    # Currency defaults silently to KES
     if "Currency" in missing:
         df_norm["Currency"] = "KES"
         missing = [m for m in missing if m != "Currency"]
@@ -893,7 +967,6 @@ def render_upload_section(politician_slug, target_name=""):
         df_norm["Description"] = "—"
         missing = [m for m in missing if m != "Description"]
 
-    # Manual mapping for anything still missing
     if missing:
         st.warning(f"Could not auto-map: **{', '.join(missing)}**")
         all_cols = ["— skip —"] + list(df_raw.columns)
@@ -902,7 +975,7 @@ def render_upload_section(politician_slug, target_name=""):
             hints = {"Amount": "cost / spend / total / payment / kiasi",
                      "Description": "narration / purpose / details / maelezo"}
             mapping[field] = st.selectbox(
-                f"Which column is **{field}**?  *({hints.get(field,'')})*",
+                f"Which column is **{field}**?  *({hints.get(field, '')})*",
                 all_cols, key=f"map_{politician_slug}_{field}")
         if st.button("Apply mapping", key=f"apply_{politician_slug}"):
             for field, col in mapping.items():
@@ -913,9 +986,8 @@ def render_upload_section(politician_slug, target_name=""):
     if "Amount" not in df_norm.columns:
         st.error("Amount column is required."); return
 
-    # Clean amounts
     df_norm["Amount"] = (df_norm["Amount"].astype(str)
-                         .str.replace(r"[^\d.]","",regex=True))
+                         .str.replace(r"[^\d.]", "", regex=True))
     df_norm["Amount"] = pd.to_numeric(df_norm["Amount"], errors="coerce")
     df_norm = df_norm.dropna(subset=["Amount"])
 
@@ -925,14 +997,14 @@ def render_upload_section(politician_slug, target_name=""):
 
     if st.button("🔒 Lock all rows into ledger", key=f"lock_{politician_slug}",
                  use_container_width=True):
-        results = {"ok":0, "quarantined":0, "duplicate":0, "rejected":0}
+        results = {"ok": 0, "quarantined": 0, "duplicate": 0, "rejected": 0}
         dup_details, reject_details = [], []
 
         for _, row in df_norm.iterrows():
-            amt_orig  = float(row["Amount"])
-            curr      = str(row.get("Currency","KES")).strip().upper()
-            desc      = str(row.get("Description","—")).strip()
-            amt_kes   = to_kes(amt_orig, curr, rates)
+            amt_orig = float(row["Amount"])
+            curr     = str(row.get("Currency", "KES")).strip().upper()
+            desc     = str(row.get("Description", "—")).strip()
+            amt_kes  = to_kes(amt_orig, curr, rates)
 
             result = safe_insert_expense(
                 politician_slug, target_name,
@@ -949,7 +1021,6 @@ def render_upload_section(politician_slug, target_name=""):
             elif status == "rejected":
                 reject_details.append(result["reason"])
 
-        # Summary report
         if results["ok"]:
             st.success(f"✅ {results['ok']} records locked to **{target_name}**.")
         if results["quarantined"]:
@@ -968,7 +1039,6 @@ def render_upload_section(politician_slug, target_name=""):
         st.rerun()
 
 def render_reviews_section(politician_slug, df_expenses):
-    """Community reviews + shadow voting for a politician profile."""
     st.markdown("---")
     st.subheader("🕵️ Community Investigations")
     st.caption(
@@ -976,7 +1046,7 @@ def render_reviews_section(politician_slug, df_expenses):
         "Reviews are ranked by community votes."
     )
 
-    col_submit, col_feed = st.columns([1,1])
+    col_submit, col_feed = st.columns([1, 1])
 
     with col_submit:
         st.markdown("#### Publish a Finding")
@@ -989,7 +1059,6 @@ def render_reviews_section(politician_slug, df_expenses):
                 r_title = st.text_input("Finding title",
                     placeholder="e.g. V8 rental traced to shell company")
 
-                # Optionally link to a specific expense record
                 rec_options = ["— General finding (no specific record) —"]
                 if not df_expenses.empty:
                     for _, row in df_expenses.iterrows():
@@ -1041,18 +1110,33 @@ def render_reviews_section(politician_slug, df_expenses):
                         st.caption(f"🔗 Linked to expense `{str(row['record_id'])[:8]}…`")
                     st.write(row["findings"])
 
-                    if st.button("⬆️ Upvote", key=f"vote_{row['id']}"):
+                    rid = int(row["id"])
+                    anon = st.session_state.get("anon_id")
+
+                    # FIX [11]: Check both session set and DB before allowing vote
+                    already_voted = (
+                        rid in st.session_state["voted_reviews"] or
+                        (anon and has_voted(rid, anon))
+                    )
+
+                    if already_voted:
+                        st.caption("✅ You've already voted on this finding.")
+                    elif st.button("⬆️ Upvote", key=f"vote_{rid}"):
                         now = time.time()
                         if now - st.session_state["last_action_time"] < RATE_LIMIT_SECS:
                             st.error(f"⏳ Please wait {RATE_LIMIT_SECS:.0f}s between votes.")
+                        elif anon is None:
+                            st.warning("Generate a Citizen ID to vote.")
                         else:
                             st.session_state["last_action_time"] = now
-                            # SHADOW VOTE — low trust = power 0, UI still says success
                             vp = 1 if st.session_state["trust_score"] >= TRUST_VOTE_GATE else 0
-                            cast_vote(int(row["id"]), vp)
-                            log("VOTE", st.session_state["anon_id"],
-                                f"review_id={row['id']} power={vp}")
-                            st.success("Vote recorded! Thank you.")
+                            success = cast_vote(rid, anon, vp)
+                            if success:
+                                st.session_state["voted_reviews"].add(rid)
+                                log("VOTE", anon, f"review_id={rid} power={vp}")
+                                st.success("Vote recorded! Thank you.")
+                            else:
+                                st.info("You've already voted on this finding.")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 9.  VIEW ROUTER
@@ -1066,7 +1150,6 @@ if view == "directory":
     st.title("🏛️ Politician Directory")
     st.caption("Search and browse all tracked politicians. Click a profile to view their records.")
 
-    # Search bar
     query = st.text_input("🔍 Search by name, role, party, county or constituency",
                           placeholder="e.g. Nairobi, Governor, ODM…",
                           label_visibility="collapsed")
@@ -1076,7 +1159,6 @@ if view == "directory":
     if df_pols.empty:
         st.info("No politicians found. Use **➕ Add New Politician** in the sidebar.")
     else:
-        # Summary stats bar
         all_expenses = get_expenses()
         all_analyzed = run_pipeline(all_expenses, rates) if not all_expenses.empty \
                        else pd.DataFrame()
@@ -1084,7 +1166,6 @@ if view == "directory":
         st.caption(f"Showing **{len(df_pols)}** profiles")
         st.divider()
 
-        # Render as a grid of cards — 3 per row
         cols_per_row = 3
         rows = [df_pols.iloc[i:i+cols_per_row]
                 for i in range(0, len(df_pols), cols_per_row)]
@@ -1094,29 +1175,21 @@ if view == "directory":
             for col, (_, pol) in zip(cols, row_df.iterrows()):
                 with col:
                     with st.container(border=True):
-                        # Avatar initial circle
+                        # FIX [4]: HTML-escape initials before injecting into markup
                         initials = "".join(w[0].upper()
-                                          for w in pol["full_name"].split()[:2])
+                                           for w in pol["full_name"].split()[:2])
 
-                        # Get quick stats for this politician
                         pol_exp = all_analyzed[
                             all_analyzed["politician_slug"] == pol["slug"]
                         ] if not all_analyzed.empty else pd.DataFrame()
 
-                        n_exp    = len(pol_exp)
-                        total_k  = pol_exp["amount_kes"].sum() if n_exp else 0
-                        n_flag   = int(pol_exp["is_flagged"].sum()) if n_exp else 0
-                        n_rev    = len(get_reviews(pol["slug"]))
+                        n_exp   = len(pol_exp)
+                        total_k = pol_exp["amount_kes"].sum() if n_exp else 0
+                        n_flag  = int(pol_exp["is_flagged"].sum()) if n_exp else 0
+                        n_rev   = len(get_reviews(pol["slug"]))
 
-                        st.markdown(
-                            f"<div style='width:48px;height:48px;border-radius:50%;"
-                            f"background:#1f4e79;color:white;display:flex;"
-                            f"align-items:center;justify-content:center;"
-                            f"font-size:18px;font-weight:600;margin-bottom:8px'>"
-                            f"{initials}</div>",
-                            unsafe_allow_html=True,
-                        )
-                        st.markdown(f"**{pol['full_name']}**")
+                        st.markdown(safe_avatar(initials), unsafe_allow_html=True)
+                        st.markdown(f"**{html_mod.escape(pol['full_name'])}**")
                         if pol["role"]:
                             st.caption(pol["role"])
                         if pol["party"]:
@@ -1126,9 +1199,9 @@ if view == "directory":
 
                         st.markdown("---")
                         m1, m2, m3 = st.columns(3)
-                        m1.metric("Records",  n_exp)
-                        m2.metric("Flagged",  n_flag)
-                        m3.metric("Reviews",  n_rev)
+                        m1.metric("Records", n_exp)
+                        m2.metric("Flagged", n_flag)
+                        m3.metric("Reviews", n_rev)
 
                         if n_exp:
                             st.caption(f"KES {total_k:,.0f} total declared")
@@ -1155,22 +1228,22 @@ elif view == "create":
     with st.form("create_politician_form"):
         st.markdown("#### Basic Information")
         c1, c2 = st.columns(2)
-        full_name    = c1.text_input("Full Name *", placeholder="e.g. Jane Akinyi Odhiambo")
-        role         = c2.selectbox("Role / Position", [""] + ROLES)
+        full_name = c1.text_input("Full Name *", placeholder="e.g. Jane Akinyi Odhiambo")
+        role      = c2.selectbox("Role / Position", [""] + ROLES)
 
         c3, c4 = st.columns(2)
-        party        = c3.text_input("Party / Coalition", placeholder="e.g. ODM, UDA, Jubilee…")
-        county       = c4.selectbox("County", [""] + COUNTIES)
+        party  = c3.text_input("Party / Coalition", placeholder="e.g. ODM, UDA, Jubilee…")
+        county = c4.selectbox("County", [""] + COUNTIES)
 
         constituency = st.text_input("Constituency / Ward",
                                      placeholder="e.g. Westlands, Kibra, Langata…")
 
         st.markdown("#### Optional Details")
-        bio          = st.text_area("Short Bio / Context",
-                                    placeholder="Role in government, notable positions, "
-                                                "years in office…", height=80)
-        photo_url    = st.text_input("Photo URL (optional)",
-                                     placeholder="https://… (publicly accessible image)")
+        bio       = st.text_area("Short Bio / Context",
+                                 placeholder="Role in government, notable positions, "
+                                             "years in office…", height=80)
+        photo_url = st.text_input("Photo URL (optional)",
+                                  placeholder="https://… (publicly accessible image)")
 
         submitted = st.form_submit_button("Create Profile", use_container_width=True)
 
@@ -1184,7 +1257,7 @@ elif view == "create":
                 created_by=st.session_state["anon_id"],
             )
             st.success(f"✅ Profile created for **{full_name}**!")
-            st.session_state.update({"view":"profile","active_slug":slug})
+            st.session_state.update({"view": "profile", "active_slug": slug})
             st.rerun()
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1192,18 +1265,17 @@ elif view == "create":
 # ═══════════════════════════════════════════════════════════════════════════════
 elif view == "profile":
     slug = st.session_state["active_slug"]
-    pol  = get_politician(slug)
+    pol  = get_politician(slug)  # FIX [5]: single query via row_factory
 
     if pol is None:
         st.error("Profile not found.")
         st.stop()
 
-    # ── Back button ──────────────────────────────────────────────────────────
     if st.button("← Back to Directory"):
-        st.session_state.update({"view":"directory","active_slug":None})
+        st.session_state.update({"view": "directory", "active_slug": None})
         st.rerun()
 
-    # ── Profile header ───────────────────────────────────────────────────────
+    # FIX [4]: Escape politician name before using in HTML
     initials = "".join(w[0].upper() for w in pol["full_name"].split()[:2])
     hcol1, hcol2 = st.columns([1, 4])
 
@@ -1212,19 +1284,11 @@ elif view == "profile":
             try:
                 st.image(pol["photo_url"], width=120)
             except Exception:
-                st.markdown(
-                    f"<div style='width:100px;height:100px;border-radius:50%;"
-                    f"background:#1f4e79;color:white;display:flex;"
-                    f"align-items:center;justify-content:center;"
-                    f"font-size:32px;font-weight:600'>{initials}</div>",
-                    unsafe_allow_html=True)
+                st.markdown(safe_avatar(initials, size=100, font=32, margin_bottom=0),
+                            unsafe_allow_html=True)
         else:
-            st.markdown(
-                f"<div style='width:100px;height:100px;border-radius:50%;"
-                f"background:#1f4e79;color:white;display:flex;"
-                f"align-items:center;justify-content:center;"
-                f"font-size:32px;font-weight:600'>{initials}</div>",
-                unsafe_allow_html=True)
+            st.markdown(safe_avatar(initials, size=100, font=32, margin_bottom=0),
+                        unsafe_allow_html=True)
 
     with hcol2:
         st.title(pol["full_name"])
@@ -1239,25 +1303,22 @@ elif view == "profile":
 
     st.divider()
 
-    # ── Quick stats ──────────────────────────────────────────────────────────
-    df_exp = get_expenses(slug)
-    df_analyzed = run_pipeline(df_exp, rates) if not df_exp.empty \
-                  else pd.DataFrame()
+    df_exp      = get_expenses(slug)
+    df_analyzed = run_pipeline(df_exp, rates) if not df_exp.empty else pd.DataFrame()
 
     n_exp   = len(df_analyzed)
-    total_k = df_analyzed["amount_kes"].sum()  if n_exp else 0
-    n_flag  = int(df_analyzed["is_flagged"].sum()) if n_exp else 0
+    total_k = df_analyzed["amount_kes"].sum()       if n_exp else 0
+    n_flag  = int(df_analyzed["is_flagged"].sum())  if n_exp else 0
     n_rev   = len(get_reviews(slug))
 
-    s1,s2,s3,s4 = st.columns(4)
+    s1, s2, s3, s4 = st.columns(4)
     s1.metric("Total Declared (KES)", f"KES {total_k:,.0f}")
-    s2.metric("Expense Records",      n_exp)
-    s3.metric("AI-Flagged Items",     n_flag,
+    s2.metric("Expense Records",       n_exp)
+    s3.metric("AI-Flagged Items",      n_flag,
               delta=f"{n_flag/n_exp*100:.0f}%" if n_exp else None,
               delta_color="inverse")
-    s4.metric("Community Reviews",   n_rev)
+    s4.metric("Community Reviews",    n_rev)
 
-    # ── Profile tabs ─────────────────────────────────────────────────────────
     (tab_expenses, tab_upload, tab_benford,
      tab_reviews, tab_modq, tab_edit) = st.tabs([
         "💰 Expenses", "📤 Upload Records",
@@ -1273,10 +1334,9 @@ elif view == "profile":
         if df_analyzed.empty:
             st.info("No financial records yet. Use the **Upload Records** tab to add them.")
         else:
-            # Filter controls
             fc1, fc2 = st.columns(2)
-            ff = fc1.selectbox("Show", ["All","Flagged only","Clean only"],
-                               key="exp_filter")
+            ff      = fc1.selectbox("Show", ["All","Flagged only","Clean only"],
+                                    key="exp_filter")
             sort_by = fc2.selectbox("Sort by",
                                     ["Newest first","Largest amount","Smallest amount"],
                                     key="exp_sort")
@@ -1285,14 +1345,13 @@ elif view == "profile":
             if ff == "Flagged only": ds = ds[ds["is_flagged"]]
             elif ff == "Clean only": ds = ds[~ds["is_flagged"]]
 
-            if sort_by == "Largest amount":  ds = ds.sort_values("amount_kes", ascending=False)
+            if sort_by == "Largest amount":   ds = ds.sort_values("amount_kes", ascending=False)
             elif sort_by == "Smallest amount": ds = ds.sort_values("amount_kes")
 
-            # Render as cards for readability
             for _, row in ds.iterrows():
                 flag_icon = "⚠️" if row["is_flagged"] else "✅"
                 with st.container(border=True):
-                    ec1, ec2 = st.columns([3,1])
+                    ec1, ec2 = st.columns([3, 1])
                     with ec1:
                         st.markdown(
                             f"{flag_icon} **{row['currency']} "
@@ -1330,18 +1389,36 @@ elif view == "profile":
                         )
                         if result["status"] == "ok":
                             st.success("Record locked.")
+                            st.rerun()
                         elif result["status"] == "duplicate":
+                            # FIX [7]: Actually render the force-submit checkbox
                             st.warning(
-                                f"Duplicate detected — this exact record already "
-                                f"exists (ID: {result['existing_record_id'][:8]}…, "
-                                f"added {result['timestamp'][:10]}). "
-                                "Tick the checkbox below to force-submit anyway."
+                                f"⚠️ Duplicate detected — this exact record already exists "
+                                f"(ID: {result['existing_record_id'][:8]}…, "
+                                f"added {result['timestamp'][:10]})."
                             )
+                            if st.checkbox(
+                                "Force-submit anyway (I confirm this is not a duplicate)",
+                                key=f"force_{slug}_{m_amt}_{m_desc}",
+                            ):
+                                r2 = safe_insert_expense(
+                                    slug, pol["full_name"],
+                                    to_kes(m_amt, m_curr, rates),
+                                    m_amt, m_curr, m_desc.strip(),
+                                    submitted_by=st.session_state["anon_id"],
+                                    force=True,
+                                )
+                                if r2["status"] == "ok":
+                                    st.success("Force-submitted.")
+                                    st.rerun()
+                                elif r2["status"] == "quarantined":
+                                    st.warning(r2["reason"])
+                                elif r2["status"] == "rejected":
+                                    st.error(r2["reason"])
                         elif result["status"] == "quarantined":
                             st.warning(result["reason"])
                         elif result["status"] == "rejected":
                             st.error(result["reason"])
-                        st.rerun()
                     else:
                         st.error("Description is required.")
 
@@ -1357,33 +1434,55 @@ elif view == "profile":
                 f"{slug}_expenses.xlsx", "application/vnd.ms-excel",
             )
 
-            # Correction form
+            # Correction form — FIX [2]: Routes through safe_insert_expense
             st.divider()
             st.markdown("##### Submit a Correction (creates new version, never deletes)")
             edit_rid = st.selectbox(
                 "Select record to correct",
                 df_analyzed["record_id"].tolist(),
                 format_func=lambda x: (
-                    f"{x[:8]}… — {df_analyzed[df_analyzed['record_id']==x].iloc[0]['description'][:40]}"
+                    f"{x[:8]}… — "
+                    f"{df_analyzed[df_analyzed['record_id']==x].iloc[0]['description'][:40]}"
                 ),
             )
             with st.form(f"correct_{slug}"):
                 ec1, ec2, ec3 = st.columns(3)
                 new_amt  = ec1.number_input("Corrected Amount",
-                                            min_value=0.01, format="%.2f")
+                                             min_value=0.01, format="%.2f")
                 new_curr = ec2.selectbox("Currency",
-                                         ["KES","USD","GBP","EUR","TZS","UGX"])
+                                          ["KES","USD","GBP","EUR","TZS","UGX"])
                 new_desc = ec3.text_input("Corrected Description")
                 if st.form_submit_button("Submit Correction"):
-                    old = df_analyzed[df_analyzed["record_id"]==edit_rid].iloc[0]
-                    insert_expense(
-                        slug, new_amt, new_curr, new_desc,
-                        record_id=edit_rid,
-                        version=int(old["version"])+1,
-                        submitted_by=st.session_state["anon_id"],
-                    )
-                    st.success(f"Version {int(old['version'])+1} created. Original archived.")
-                    st.rerun()
+                    if not new_desc.strip():
+                        st.error("Description is required.")
+                    else:
+                        old = df_analyzed[df_analyzed["record_id"] == edit_rid].iloc[0]
+                        amt_kes = to_kes(new_amt, new_curr, rates)
+                        # FIX [2]: Go through safe_insert_expense (rate limit, bounds, quarantine)
+                        result = safe_insert_expense(
+                            slug, pol["full_name"],
+                            amt_kes, new_amt, new_curr, new_desc.strip(),
+                            submitted_by=st.session_state["anon_id"],
+                            force=True,   # corrections intentionally override duplicates
+                        )
+                        if result["status"] == "ok":
+                            # Mark the old version inactive and bump version number
+                            with sqlite3.connect(DB_PATH) as conn:
+                                conn.execute(
+                                    "UPDATE expenses SET is_active=0, version=? "
+                                    "WHERE record_id=? AND version=?",
+                                    (int(old["version"]) + 1, edit_rid,
+                                     int(old["version"])))
+                                conn.commit()
+                            st.success(
+                                f"Version {int(old['version'])+1} created. "
+                                "Original archived."
+                            )
+                            st.rerun()
+                        elif result["status"] == "quarantined":
+                            st.warning(result["reason"])
+                        elif result["status"] == "rejected":
+                            st.error(result["reason"])
 
     # ── TAB: UPLOAD ──────────────────────────────────────────────────────────
     with tab_upload:
@@ -1408,7 +1507,7 @@ elif view == "profile":
         render_reviews_section(slug, df_analyzed if not df_analyzed.empty
                                else pd.DataFrame())
 
-    # ── TAB: MODERATOR QUEUE ────────────────────────────────────────────────
+    # ── TAB: MODERATOR QUEUE ─────────────────────────────────────────────────
     with tab_modq:
         st.subheader(f"Moderator Review Queue — {pol['full_name']}")
         st.caption(
@@ -1418,7 +1517,7 @@ elif view == "profile":
         if not st.session_state.get("authenticated"):
             st.warning("Moderator access required.")
         else:
-            df_q = get_quarantine()
+            df_q     = get_quarantine()
             df_q_pol = df_q[
                 (df_q["politician_slug"] == slug) &
                 (df_q["status"] == "pending")
@@ -1429,7 +1528,7 @@ elif view == "profile":
                 st.warning(f"**{len(df_q_pol)} record(s) pending review.**")
                 for _, qrow in df_q_pol.iterrows():
                     with st.container(border=True):
-                        qc1, qc2 = st.columns([3,1])
+                        qc1, qc2 = st.columns([3, 1])
                         with qc1:
                             st.markdown(
                                 f"**{qrow['currency']} {qrow['original_amount']:,.2f}**"
@@ -1473,10 +1572,10 @@ elif view == "profile":
                                      index=([""] + ROLES).index(pol["role"])
                                      if pol.get("role") in ROLES else 0)
             e3, e4 = st.columns(2)
-            new_party = e3.text_input("Party / Coalition", value=pol["party"] or "")
-            new_county= e4.selectbox("County", [""] + COUNTIES,
-                                     index=([""] + COUNTIES).index(pol["county"])
-                                     if pol.get("county") in COUNTIES else 0)
+            new_party  = e3.text_input("Party / Coalition", value=pol["party"] or "")
+            new_county = e4.selectbox("County", [""] + COUNTIES,
+                                      index=([""] + COUNTIES).index(pol["county"])
+                                      if pol.get("county") in COUNTIES else 0)
             new_const = st.text_input("Constituency / Ward",
                                       value=pol["constituency"] or "")
             new_bio   = st.text_area("Bio", value=pol["bio"] or "", height=80)
@@ -1507,34 +1606,30 @@ elif view == "overview":
         st.info("No financial records yet.")
         st.stop()
 
-    df_all = run_pipeline(all_exp, rates)
+    df_all  = run_pipeline(all_exp, rates)
     df_pols = get_all_politicians()
 
-    # KPIs
-    k1,k2,k3,k4 = st.columns(4)
+    k1, k2, k3, k4 = st.columns(4)
     k1.metric("Total Declared (KES)", f"KES {df_all['amount_kes'].sum():,.0f}")
-    k2.metric("Total Records",        f"{len(df_all):,}")
-    k3.metric("Politicians Tracked",  f"{df_pols.shape[0]}")
-    k4.metric("AI-Flagged Items",     int(df_all["is_flagged"].sum()),
+    k2.metric("Total Records",         f"{len(df_all):,}")
+    k3.metric("Politicians Tracked",   f"{df_pols.shape[0]}")
+    k4.metric("AI-Flagged Items",       int(df_all["is_flagged"].sum()),
               delta=f"{df_all['is_flagged'].mean()*100:.1f}% of all",
               delta_color="inverse")
 
     st.divider()
-    c1,c2 = st.columns(2)
+    c1, c2 = st.columns(2)
     with c1:
         st.markdown("##### Total Declared Spending per Politician (KES)")
         spend = (df_all.merge(df_pols[["slug","full_name"]],
-                              left_on="politician_slug", right_on="slug",
-                              how="left")
+                              left_on="politician_slug", right_on="slug", how="left")
                  .groupby("full_name")["amount_kes"].sum()
                  .sort_values(ascending=False))
         st.bar_chart(spend)
-
     with c2:
         st.markdown("##### AI-Flagged Anomalies per Politician")
         flags = (df_all.merge(df_pols[["slug","full_name"]],
-                              left_on="politician_slug", right_on="slug",
-                              how="left")
+                              left_on="politician_slug", right_on="slug", how="left")
                  .groupby("full_name")["is_flagged"].sum()
                  .sort_values(ascending=False))
         st.bar_chart(flags)
@@ -1543,18 +1638,17 @@ elif view == "overview":
     st.markdown("##### Benford's Law — All Politicians")
     rows = []
     for _, pol in df_pols.iterrows():
-        sub = df_all[df_all["politician_slug"]==pol["slug"]]["amount_kes"]
+        sub = df_all[df_all["politician_slug"] == pol["slug"]]["amount_kes"]
         res = benfords_score(sub)
         rows.append({
-            "Politician":            pol["full_name"],
-            "Role":                  pol.get("role",""),
-            "County":                pol.get("county",""),
-            "Records":               len(sub),
+            "Politician":              pol["full_name"],
+            "Role":                    pol.get("role", ""),
+            "County":                  pol.get("county", ""),
+            "Records":                 len(sub),
             "Benford Suspicion Score": res[0] if res else "Need ≥10",
         })
     st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
 
-    # Full export
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
         df_all.to_excel(w, index=False, sheet_name="All Expenses")
@@ -1579,21 +1673,19 @@ elif view == "modqueue":
         st.error("Moderator access required.")
         st.stop()
 
-    df_q_all = get_quarantine()
+    df_q_all     = get_quarantine()
     df_q_pending = df_q_all[df_q_all["status"] == "pending"]
 
-    # Summary metrics
     qm1, qm2, qm3 = st.columns(3)
-    qm1.metric("Pending Review",  len(df_q_pending))
-    qm2.metric("Approved",  len(df_q_all[df_q_all["status"]=="approved"]))
-    qm3.metric("Rejected",  len(df_q_all[df_q_all["status"]=="rejected"]))
+    qm1.metric("Pending Review", len(df_q_pending))
+    qm2.metric("Approved",  len(df_q_all[df_q_all["status"] == "approved"]))
+    qm3.metric("Rejected",  len(df_q_all[df_q_all["status"] == "rejected"]))
 
     st.divider()
 
     if df_q_pending.empty:
         st.success("✅ No pending items across any politician.")
     else:
-        # Group by politician for easier scanning
         df_pols_lookup = get_all_politicians().set_index("slug")["full_name"].to_dict()
 
         for pol_slug, group in df_q_pending.groupby("politician_slug"):
@@ -1631,7 +1723,6 @@ elif view == "modqueue":
                             st.info("Rejected.")
                             st.rerun()
 
-    # Show recent decisions
     st.divider()
     st.subheader("Recent Decisions")
     df_decided = df_q_all[df_q_all["status"] != "pending"].sort_values(
@@ -1641,11 +1732,12 @@ elif view == "modqueue":
     else:
         display = df_decided[["politician_slug","original_amount","currency",
                                "description","status","reviewed_by","timestamp"]].copy()
-        display["politician"] = display["politician_slug"].map(df_pols_lookup)
+        display["politician"] = display["politician_slug"].map(
+            get_all_politicians().set_index("slug")["full_name"].to_dict())
         st.dataframe(
             display[["politician","original_amount","currency",
                       "description","status","reviewed_by","timestamp"]],
-            hide_index=True, use_container_width=True
+            hide_index=True, use_container_width=True,
         )
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1665,7 +1757,6 @@ elif view == "audit":
         df_hist = get_all_expenses_history()
         df_hist["Status"] = df_hist["is_active"].apply(
             lambda x: "✅ Active" if x else "🗃 Archived")
-        # Filter controls
         ath_pol = st.multiselect(
             "Filter by politician slug",
             options=sorted(df_hist["politician_slug"].unique()),
@@ -1691,11 +1782,6 @@ elif view == "audit":
         if df_log.empty:
             st.info("No actions logged yet.")
         else:
-            # Highlight security events
-            security_actions = {
-                "RATE_LIMIT_BLOCK","AMOUNT_BOUNDS_BLOCK","QUARANTINE",
-                "QUARANTINE_APPROVE","QUARANTINE_REJECT",
-            }
             action_filter = st.multiselect(
                 "Filter by action type",
                 options=sorted(df_log["action"].unique()),
@@ -1719,7 +1805,7 @@ elif view == "audit":
                 "Show", ["All","pending","approved","rejected"],
                 key="q_status_filter")
             if status_filter != "All":
-                df_qlog = df_qlog[df_qlog["status"]==status_filter]
+                df_qlog = df_qlog[df_qlog["status"] == status_filter]
             st.dataframe(df_qlog, hide_index=True, use_container_width=True)
 
     with audit_t4:
@@ -1736,7 +1822,6 @@ elif view == "audit":
         if df_rl.empty:
             st.info("No rate limit events recorded.")
         else:
-            # Frequency table
             freq = df_rl["actor_id"].value_counts().reset_index()
             freq.columns = ["Citizen ID", "Times Blocked"]
             st.markdown("**Most blocked submitters:**")
